@@ -5,8 +5,8 @@ Core portfolio construction and risk analysis logic:
 
   1. Efficient frontier optimization (Modern Portfolio Theory) via PyPortfolioOpt
   2. Risk-tier portfolio assignment (Conservative / Moderate / Aggressive)
-  3. Value-at-Risk (VaR) and Sharpe ratio calculation per tier (stub)
-  4. Rebalancing rule simulation (stub)
+  3. Value-at-Risk (VaR) and Sharpe ratio calculation per tier
+  4. Rebalancing rule simulation (5% drift threshold)
   5. Benchmark comparison against a 60/40 portfolio (stub)
 
 Usage:
@@ -135,15 +135,11 @@ def optimize_for_target_volatility(
     ef = EfficientFrontier(mu, cov_matrix)
     ef.efficient_risk(target_volatility=used_vol)
     performance = ef.portfolio_performance(risk_free_rate=RISK_FREE_RATE)
-    # clean_weights drops allocations below cutoff and renormalises to 1
     cleaned = ef.clean_weights(cutoff=weight_cutoff, rounding=4)
     weights = {t: float(w) for t, w in cleaned.items() if w > 0}
     total = sum(weights.values())
     if total > 0 and abs(total - 1.0) > 1e-8:
-        weights = {
-            t: round(w / total, 4) for t, w in weights.items()
-        }
-        # Fix residual rounding so weights sum exactly to 1
+        weights = {t: round(w / total, 4) for t, w in weights.items()}
         top = max(weights, key=weights.get)
         weights[top] = round(weights[top] + (1.0 - sum(weights.values())), 4)
     return weights, tuple(float(x) for x in performance), used_vol
@@ -234,26 +230,154 @@ def assign_clients_to_portfolios(
     return profiles_df.merge(tier_df, on="risk_tier", how="left")
 
 
-def calculate_var(portfolio_returns: pd.Series, confidence: float = 0.95) -> float:
-    """Calculate historical Value-at-Risk at the given confidence level."""
-    raise NotImplementedError
+def _weight_vector(
+    returns: pd.DataFrame, weights: dict[str, float]
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Align target weights to the returns columns; renormalise to sum to 1."""
+    tickers = [t for t in weights if t in returns.columns and weights[t] > 0]
+    if not tickers:
+        raise ValueError("No overlapping tickers between weights and returns")
+    w = pd.Series({t: float(weights[t]) for t in tickers}, dtype=float)
+    w = w / w.sum()
+    return returns[tickers].astype(float), w
+
+
+def portfolio_daily_returns(
+    returns: pd.DataFrame, weights: dict[str, float]
+) -> pd.Series:
+    """Constant-mix (daily-rebalanced) portfolio return series."""
+    r, w = _weight_vector(returns, weights)
+    return r.fillna(0.0).mul(w, axis=1).sum(axis=1)
+
+
+def realized_annualized_stats(
+    portfolio_returns: pd.Series, risk_free_rate: float = RISK_FREE_RATE
+) -> tuple[float, float, float]:
+    """Annualized return, vol, and Sharpe from a daily portfolio return series."""
+    daily_mean = float(portfolio_returns.mean())
+    daily_std = float(portfolio_returns.std(ddof=1))
+    ann_return = daily_mean * 252
+    ann_vol = daily_std * np.sqrt(252)
+    sharpe = (ann_return - risk_free_rate) / ann_vol if ann_vol > 0 else float("nan")
+    return ann_return, ann_vol, sharpe
+
+
+def calculate_var(
+    returns: pd.DataFrame,
+    weights: dict[str, float],
+    confidence: float = 0.95,
+) -> float:
+    """
+    Historical (empirical) VaR of the weighted portfolio return series.
+
+    Uses the (1 - confidence) quantile of daily portfolio returns — not a
+    parametric/Gaussian VaR. Returns a positive percentage loss figure
+    (e.g. 1.85 means a 1.85% one-day loss at the given confidence).
+    """
+    port_rets = portfolio_daily_returns(returns, weights)
+    alpha = (1.0 - confidence) * 100.0
+    quantile = float(np.percentile(port_rets.to_numpy(), alpha))
+    return abs(min(quantile, 0.0)) * 100.0
 
 
 def calculate_sharpe_ratio(
-    portfolio_returns: pd.Series, risk_free_rate: float = RISK_FREE_RATE
+    returns: pd.DataFrame,
+    weights: dict[str, float],
+    risk_free_rate: float = RISK_FREE_RATE,
 ) -> float:
-    """Calculate the annualized Sharpe ratio for a portfolio's return series."""
-    raise NotImplementedError
+    """
+    Annualized Sharpe from realized daily portfolio returns over the sample
+    window: (mean * 252 - rf) / (std * sqrt(252)).
+    """
+    port_rets = portfolio_daily_returns(returns, weights)
+    _, _, sharpe = realized_annualized_stats(port_rets, risk_free_rate=risk_free_rate)
+    return float(sharpe)
 
 
 def simulate_rebalancing(
-    weights_over_time: pd.DataFrame, drift_threshold: float = 0.05
-) -> int:
+    returns: pd.DataFrame,
+    target_weights: dict[str, float],
+    drift_threshold: float = 0.05,
+) -> dict:
     """
-    Simulate a rebalancing rule: count how many times allocation would have
-    drifted more than `drift_threshold` from target weights.
+    Walk forward day by day: let weights drift with asset returns (no trading).
+    Whenever any single asset's weight drifts more than `drift_threshold` from
+    its target, log the date and reset to target weights.
+
+    Returns dict with:
+      - n_rebalances
+      - rebalance_dates
+      - avg_holding_period_days (mean trading days between consecutive
+        rebalance events; if one event, days from start to that event; if
+        none, full sample length)
     """
-    raise NotImplementedError
+    r, target = _weight_vector(returns, target_weights)
+    r = r.fillna(0.0)
+    dates = list(r.index)
+    current = target.copy()
+    rebalance_dates: list = []
+
+    for dt in dates:
+        day_ret = r.loc[dt]
+        current = current * (1.0 + day_ret)
+        total = float(current.sum())
+        if total <= 0:
+            current = target.copy()
+            continue
+        current = current / total
+
+        if float((current - target).abs().max()) > drift_threshold:
+            rebalance_dates.append(dt)
+            current = target.copy()
+
+    n_rebalances = len(rebalance_dates)
+    if n_rebalances == 0:
+        avg_holding = float(len(dates))
+    elif n_rebalances == 1:
+        avg_holding = float(dates.index(rebalance_dates[0]) + 1)
+    else:
+        locs = [dates.index(d) for d in rebalance_dates]
+        avg_holding = float(np.diff(locs).mean())
+
+    return {
+        "n_rebalances": n_rebalances,
+        "rebalance_dates": rebalance_dates,
+        "avg_holding_period_days": avg_holding,
+    }
+
+
+def evaluate_tier_risk_metrics(
+    returns: pd.DataFrame,
+    tier_portfolios: dict[str, dict],
+    confidence: float = 0.95,
+    risk_free_rate: float = RISK_FREE_RATE,
+    drift_threshold: float = 0.05,
+) -> pd.DataFrame:
+    """Run VaR, Sharpe, and rebalancing simulation for each tier; return summary."""
+    rows = []
+    for tier in RISK_TIER_TARGET_VOLATILITY:
+        weights = tier_portfolios[tier]["weights"]
+        port_rets = portfolio_daily_returns(returns, weights)
+        ann_ret, ann_vol, _ = realized_annualized_stats(
+            port_rets, risk_free_rate=risk_free_rate
+        )
+        sharpe = calculate_sharpe_ratio(returns, weights, risk_free_rate=risk_free_rate)
+        var_pct = calculate_var(returns, weights, confidence=confidence)
+        reb = simulate_rebalancing(
+            returns, weights, drift_threshold=drift_threshold
+        )
+        rows.append(
+            {
+                "tier": tier,
+                "annualized_return": ann_ret,
+                "annualized_vol": ann_vol,
+                "sharpe": sharpe,
+                "var_95_pct": var_pct,
+                "n_rebalances": reb["n_rebalances"],
+                "avg_holding_days": reb["avg_holding_period_days"],
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def compare_to_60_40_benchmark(tier_returns: dict, benchmark_returns: pd.Series):
@@ -271,6 +395,7 @@ def _format_weights(weights: dict[str, float]) -> str:
 def main():
     prices_df, profiles_df = load_data()
     returns_wide = compute_returns(prices_df)
+
     print(
         f"Universe: {returns_wide.shape[1]} tickers, "
         f"{returns_wide.shape[0]:,} daily return rows"
@@ -300,9 +425,10 @@ def main():
         print("Weights (desc, cleaned, cutoff 1%):")
         print(_format_weights(portfolio["weights"]))
         print(
-            f"Expected annual return: {perf['expected_annual_return']:.2%}\n"
-            f"Annual volatility:      {perf['annual_volatility']:.2%}\n"
-            f"Sharpe ratio (rf={RISK_FREE_RATE:.0%}): {perf['sharpe_ratio']:.3f}"
+            f"PyPortfolioOpt E[r]/vol/Sharpe: "
+            f"{perf['expected_annual_return']:.2%} / "
+            f"{perf['annual_volatility']:.2%} / "
+            f"{perf['sharpe_ratio']:.3f}"
         )
         if max_w > 0.40:
             top = max(portfolio["weights"], key=portfolio["weights"].get)
@@ -313,24 +439,29 @@ def main():
             )
         print()
 
+    summary = evaluate_tier_risk_metrics(returns_wide, tier_portfolios)
     print("=" * 60)
+    print("Risk & rebalancing summary (realized 2013–2018)")
+    print(
+        f"{'tier':<13} {'ann_return':>10} {'ann_vol':>8} {'Sharpe':>7} "
+        f"{'95% VaR':>8} {'# rebal':>8} {'avg hold':>9}"
+    )
+    for _, row in summary.iterrows():
+        print(
+            f"{row['tier']:<13} {row['annualized_return']:>9.2%} "
+            f"{row['annualized_vol']:>7.2%} {row['sharpe']:>7.3f} "
+            f"{row['var_95_pct']:>7.2f}% {int(row['n_rebalances']):>8} "
+            f"{row['avg_holding_days']:>8.1f}d"
+        )
+    print()
+    print(
+        "VaR is historical 1-day 95% VaR as a positive % loss; "
+        "avg hold = mean trading days between rebalance events "
+        "(drift threshold 5%)."
+    )
+    print()
     print(f"Assigned {len(clients)} clients to tier portfolios:")
     print(clients.groupby("risk_tier").size().to_string())
-    print()
-    print("Sample merged clients:")
-    print(
-        clients[
-            [
-                "client_id",
-                "risk_tier",
-                "expected_annual_return",
-                "annual_volatility",
-                "sharpe_ratio",
-            ]
-        ]
-        .head(5)
-        .to_string(index=False)
-    )
 
 
 if __name__ == "__main__":
