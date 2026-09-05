@@ -324,12 +324,15 @@ def simulate_rebalancing(
       - avg_holding_period_days (mean trading days between consecutive
         rebalance events; if one event, days from start to that event; if
         none, full sample length)
+      - events: list of {date, drifted_asset, drift_amount} for the asset
+        with the largest absolute drift on each trigger day
     """
     r, target = _weight_vector(returns, target_weights)
     r = r.fillna(0.0)
     dates = list(r.index)
     current = target.copy()
     rebalance_dates: list = []
+    events: list[dict] = []
 
     for dt in dates:
         day_ret = r.loc[dt]
@@ -340,7 +343,17 @@ def simulate_rebalancing(
             continue
         current = current / total
 
-        if float((current - target).abs().max()) > drift_threshold:
+        drift = current - target
+        abs_drift = drift.abs()
+        if float(abs_drift.max()) > drift_threshold:
+            asset = str(abs_drift.idxmax())
+            events.append(
+                {
+                    "date": dt,
+                    "drifted_asset": asset,
+                    "drift_amount": float(drift.loc[asset]),
+                }
+            )
             rebalance_dates.append(dt)
             current = target.copy()
 
@@ -357,6 +370,7 @@ def simulate_rebalancing(
         "n_rebalances": n_rebalances,
         "rebalance_dates": rebalance_dates,
         "avg_holding_period_days": avg_holding,
+        "events": events,
     }
 
 
