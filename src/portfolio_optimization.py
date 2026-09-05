@@ -38,6 +38,20 @@ RISK_TIER_TARGET_VOLATILITY = {
 WEIGHT_CUTOFF = 0.01  # drop near-zero allocations below 1%
 RISK_FREE_RATE = 0.02
 
+# 60/40 benchmark proxies (no bond ETF in this universe).
+# Equity sleeve: equal-weighted Tech / Consumer / Industrials growth-cyclical basket.
+EQUITY_PROXY_TICKERS = [
+    "AAPL", "ADBE", "AMZN", "GOOGL", "MSFT",  # Tech
+    "DIS", "MCD", "NKE", "SBUX", "WMT",  # Consumer
+    "BA", "HON", "MMM",  # Industrials
+]
+
+# Bond sleeve PROXY — NOT real bonds / NOT a bond ETF.
+# Lowest-vol defensive equities (Utilities / Healthcare / Telecom) used only as a
+# stand-in for the 40% "bond" allocation because the dataset has no fixed-income
+# securities. Treat results as illustrative, not a true 60/40 stocks/bonds mix.
+BOND_PROXY_TICKERS = ["DUK", "SO", "JNJ", "T", "VZ"]
+
 # Populated by build_tier_portfolios() for get_tier_portfolio() convenience
 _LAST_TIER_PORTFOLIOS: dict[str, dict] | None = None
 
@@ -380,9 +394,79 @@ def evaluate_tier_risk_metrics(
     return pd.DataFrame(rows)
 
 
-def compare_to_60_40_benchmark(tier_returns: dict, benchmark_returns: pd.Series):
-    """Compare each risk tier's risk-adjusted return against a 60/40 benchmark."""
-    raise NotImplementedError
+def _equal_weight_basket_returns(
+    returns: pd.DataFrame, tickers: list[str]
+) -> pd.Series:
+    """Equal-weighted daily returns for a ticker basket (missing names skipped)."""
+    cols = [t for t in tickers if t in returns.columns]
+    if not cols:
+        raise ValueError(f"None of {tickers} found in returns columns")
+    return returns[cols].fillna(0.0).mean(axis=1)
+
+
+def build_60_40_benchmark(returns: pd.DataFrame) -> pd.Series:
+    """
+    Daily returns for a 60/40 proxy portfolio from the equity universe.
+
+    60% equal-weighted Tech/Consumer/Industrials basket + 40% defensive
+    equity "bond proxy" (DUK, SO, JNJ, T, VZ). The bond sleeve is a proxy,
+    not real fixed income — see BOND_PROXY_TICKERS comment.
+    """
+    equity = _equal_weight_basket_returns(returns, EQUITY_PROXY_TICKERS)
+    bond_proxy = _equal_weight_basket_returns(returns, BOND_PROXY_TICKERS)
+    benchmark = 0.60 * equity + 0.40 * bond_proxy
+    benchmark.name = "60/40_proxy"
+    return benchmark
+
+
+def max_drawdown(returns: pd.Series) -> float:
+    """Maximum drawdown of a return series (negative fraction, e.g. -0.25)."""
+    wealth = (1.0 + returns.fillna(0.0)).cumprod()
+    drawdown = wealth / wealth.cummax() - 1.0
+    return float(drawdown.min())
+
+
+def performance_metrics(
+    returns: pd.Series, risk_free_rate: float = RISK_FREE_RATE
+) -> dict[str, float]:
+    """Cumulative return, ann. return/vol, Sharpe, and max drawdown."""
+    rets = returns.dropna()
+    ann_return, ann_vol, sharpe = realized_annualized_stats(
+        rets, risk_free_rate=risk_free_rate
+    )
+    cumulative = float((1.0 + rets).prod() - 1.0)
+    return {
+        "cumulative_return": cumulative,
+        "annualized_return": ann_return,
+        "annualized_vol": ann_vol,
+        "sharpe": sharpe,
+        "max_drawdown": max_drawdown(rets),
+    }
+
+
+def compare_to_60_40_benchmark(
+    tier_returns: dict[str, pd.Series],
+    benchmark_returns: pd.Series,
+    risk_free_rate: float = RISK_FREE_RATE,
+) -> pd.DataFrame:
+    """
+    Compare each tier's cumulative return, annualized return, annualized vol,
+    Sharpe, and max drawdown against the 60/40 proxy over the same window.
+    """
+    rows = []
+    aligned_bench = benchmark_returns.dropna()
+    series_map = {**tier_returns, "60/40_proxy": aligned_bench}
+
+    for name, series in series_map.items():
+        # Align each series to the shared date intersection with the benchmark
+        common = series.dropna().index.intersection(aligned_bench.index)
+        metrics = performance_metrics(series.loc[common], risk_free_rate=risk_free_rate)
+        rows.append({"tier": name, **metrics})
+
+    order = list(RISK_TIER_TARGET_VOLATILITY.keys()) + ["60/40_proxy"]
+    df = pd.DataFrame(rows)
+    df["tier"] = pd.Categorical(df["tier"], categories=order, ordered=True)
+    return df.sort_values("tier").reset_index(drop=True)
 
 
 def _format_weights(weights: dict[str, float]) -> str:
@@ -459,6 +543,60 @@ def main():
         "avg hold = mean trading days between rebalance events "
         "(drift threshold 5%)."
     )
+    print()
+
+    # --- 60/40 proxy benchmark comparison ---
+    benchmark = build_60_40_benchmark(returns_wide)
+    equity_sleeve = _equal_weight_basket_returns(returns_wide, EQUITY_PROXY_TICKERS)
+    bond_sleeve = _equal_weight_basket_returns(returns_wide, BOND_PROXY_TICKERS)
+    eq_vol = float(equity_sleeve.std(ddof=1) * np.sqrt(252))
+    bond_vol = float(bond_sleeve.std(ddof=1) * np.sqrt(252))
+    bench_vol = float(benchmark.std(ddof=1) * np.sqrt(252))
+
+    tier_returns = {
+        tier: portfolio_daily_returns(returns_wide, tier_portfolios[tier]["weights"])
+        for tier in RISK_TIER_TARGET_VOLATILITY
+    }
+    comparison = compare_to_60_40_benchmark(tier_returns, benchmark)
+
+    print("=" * 60)
+    print("60/40 PROXY benchmark vs risk tiers (same 2013–2018 window)")
+    print(
+        "NOTE: 40% sleeve is a DEFENSIVE-EQUITY bond proxy "
+        f"({', '.join(BOND_PROXY_TICKERS)}) — not real bonds."
+    )
+    print(
+        f"Sleeve vols — equity basket: {eq_vol:.2%} | "
+        f"bond proxy: {bond_vol:.2%} | 60/40 combo: {bench_vol:.2%}"
+    )
+    print(
+        f"{'tier':<13} {'cumul':>8} {'ann_ret':>9} {'ann_vol':>8} "
+        f"{'Sharpe':>7} {'maxDD':>8}"
+    )
+    for _, row in comparison.iterrows():
+        print(
+            f"{row['tier']:<13} {row['cumulative_return']:>7.1%} "
+            f"{row['annualized_return']:>8.2%} {row['annualized_vol']:>7.2%} "
+            f"{row['sharpe']:>7.3f} {row['max_drawdown']:>7.1%}"
+        )
+
+    cons_vol = float(
+        comparison.loc[comparison["tier"] == "Conservative", "annualized_vol"].iloc[0]
+    )
+    if bond_vol >= cons_vol:
+        print(
+            f"\nFLAG: bond-proxy sleeve vol ({bond_vol:.2%}) is "
+            f"{'above' if bond_vol > cons_vol else 'at/near'} the Conservative "
+            f"tier vol ({cons_vol:.2%}). This is expected with equity stand-ins "
+            "for bonds — revisit proxy choice if a true fixed-income series "
+            "becomes available."
+        )
+    if bond_vol >= eq_vol:
+        print(
+            f"\nFLAG: bond-proxy vol ({bond_vol:.2%}) >= equity-sleeve vol "
+            f"({eq_vol:.2%}) — proxy choice needs revisiting."
+        )
+
     print()
     print(f"Assigned {len(clients)} clients to tier portfolios:")
     print(clients.groupby("risk_tier").size().to_string())
